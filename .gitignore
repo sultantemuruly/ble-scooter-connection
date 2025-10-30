@@ -1,0 +1,61 @@
+.DS_Store
+Thumbs.db
+
+# Node dependencies
+node_modules/
+
+# TypeScript build outputs
+dist/
+build/
+out/
+lib/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Package manager logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Testing / coverage
+coverage/
+.nyc_output/
+
+# Caches
+.cache/
+.parcel-cache/
+.turbo/
+
+# Env files
+.env
+.env.*
+.env.local
+.env.*.local
+
+# Editor & IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# OS / Misc
+.DS_Store?
+*.swp
+*.swo
+*.tmp
+*.bak
+*.orig
+
+# Node repl history
+.node_repl_history
+
+# NPM package archives
+*.tgz
+
+# Lockfiles from other managers (keep the one you use)
+yarn.lock
+pnpm-lock.yaml
+
