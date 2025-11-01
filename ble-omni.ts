@@ -1,26 +1,37 @@
-/* Omni BLE client for macOS (TypeScript + @abandonware/noble)
-   - Node 18 LTS recommended
-   - tsconfig: "module": "CommonJS", "target": "ES2020", "esModuleInterop": true
-   - Run examples:
-       DEBUG=noble* npx ts-node ble-omni.ts --name=omni --deviceKey=yOTmK50z --action=query
-       DEBUG=noble* npx ts-node ble-omni.ts --name=omni --deviceKey=YOURKEY --action=unlock
-       DEBUG=noble* npx ts-node ble-omni.ts --name=omni --deviceKey=YOURKEY --action=lock
-*/
+/**
+ * Omni BLE client for macOS (TypeScript + @abandonware/noble)
+ * - Node 18 LTS
+ * - tsconfig: { "module": "CommonJS", "target": "ES2020", "esModuleInterop": true }
+ *
+ * Install:
+ *   npm i @abandonware/noble
+ *   npm i -D ts-node typescript @types/node
+ *
+ * Run examples:
+ *   DEBUG=noble* npx ts-node ble-omni.ts --name=Scooter --deviceKey=YOUR8KEY --action=query --verbose
+ *   DEBUG=noble* npx ts-node ble-omni.ts --id=<corebluetooth-id> --deviceKey=YOUR8KEY --action=unlock
+ *
+ * Notes in this rewrite (handshake robustness):
+ *   - Enables notifications and waits ~250ms before first write (CoreBluetooth settle).
+ *   - Prefers write-with-response for 1st packet; falls back to without-response.
+ *   - Handles device Command Error (CMD 0x10) with readable messages.
+ *   - Longer timeouts + one retry on handshake in case first notify is missed.
+ */
 
 import noblePkg from "@abandonware/noble";
-const noble = noblePkg as any; // CommonJS module; types are dynamic on macOS
+const noble = noblePkg as any; // CJS-compatible
 
-// ---- Nordic UART (NUS) UUIDs from the spec ----
+// Nordic UART (NUS) UUIDs
 const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // write
 const NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // notify
 
-// ---- Protocol constants ----
+// Protocol constants
 const STX0 = 0xa3,
   STX1 = 0xa4;
-const DEFAULT_DEVICE_KEY = "yOTmK50z";
+const DEFAULT_DEVICE_KEY = "yOTmK50z"; // not guaranteed to work; real fleets change this
 
-// ---- CRC8 (Dallas/Maxim) lookup table used by the spec ----
+// Dallas/Maxim CRC8 table
 const CRC8_TABLE = Uint8Array.from([
   0, 94, 188, 226, 97, 63, 221, 131, 194, 156, 126, 32, 163, 253, 31, 65, 157,
   195, 33, 127, 252, 162, 64, 30, 95, 1, 227, 189, 62, 96, 130, 220, 35, 125,
@@ -37,62 +48,63 @@ const CRC8_TABLE = Uint8Array.from([
   200, 150, 21, 75, 169, 247, 182, 232, 10, 84, 215, 137, 107, 53,
 ]);
 
+const hex = (b: ArrayLike<number>) =>
+  Array.from(b, (v) => v.toString(16).padStart(2, "0")).join(" ");
+const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+
 function crc8(buf: Uint8Array): number {
   let c = 0;
   for (let i = 0; i < buf.length; i++) c = CRC8_TABLE[c ^ buf[i]];
   return c & 0xff;
 }
-
 function asciiBytes(s: string): Uint8Array {
   const out = new Uint8Array(s.length);
   for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff;
   return out;
 }
 
-const hex = (b: Uint8Array) =>
-  [...b].map((v) => v.toString(16).padStart(2, "0")).join(" ");
-const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
-
-// ---- Frame codec per spec ----
-// Frame = STX(2) | LEN(1) | RAND(1) | KEY(1) | CMD(1) | DATA(LEN bytes XORed by RAND) | CRC8(1)
-// - CRC8 is over everything before CRC (header + encrypted DATA)
+/** Build frame per Omni spec:
+ * RAND field on wire is r+0x32; KEY/CMD/DATA are XORed with r, CRC over encoded header+data.
+ * For the handshake (cmd=0x01) the header KEY MUST be 0x00.
+ * For subsequent commands, header KEY = sessionKey returned by handshake.
+ */
 function buildFrame(
   cmd: number,
   dataPlain: Uint8Array,
   keyByte: number,
   verbose = false
 ): Uint8Array {
-  const rand = (Math.random() * 256) & 0xff;
-  const dataEnc = new Uint8Array(dataPlain.length);
-  for (let i = 0; i < dataPlain.length; i++) dataEnc[i] = dataPlain[i] ^ rand;
+  const r = (Math.random() * 256) | 0;
+  const r1 = (r + 0x32) & 0xff;
 
-  const len = dataEnc.length & 0xff;
-  const header = Uint8Array.from([
-    STX0,
-    STX1,
-    len,
-    rand,
-    keyByte & 0xff,
-    cmd & 0xff,
-  ]);
-  const withoutCrc = new Uint8Array(header.length + dataEnc.length);
-  withoutCrc.set(header, 0);
-  withoutCrc.set(dataEnc, header.length);
-  const c = crc8(withoutCrc);
+  const keyX = (keyByte & 0xff) ^ r;
+  const cmdX = (cmd & 0xff) ^ r;
 
-  const frame = new Uint8Array(withoutCrc.length + 1);
-  frame.set(withoutCrc, 0);
-  frame[frame.length - 1] = c;
+  const enc = new Uint8Array(dataPlain.length);
+  for (let i = 0; i < dataPlain.length; i++) enc[i] = dataPlain[i] ^ r;
+
+  const len = enc.length & 0xff;
+  const header = Uint8Array.from([STX0, STX1, len, r1, keyX, cmdX]);
+
+  const preCrc = new Uint8Array(header.length + enc.length);
+  preCrc.set(header, 0);
+  preCrc.set(enc, header.length);
+
+  const c = crc8(preCrc);
+
+  const out = new Uint8Array(preCrc.length + 1);
+  out.set(preCrc, 0);
+  out[out.length - 1] = c;
 
   if (verbose) {
     console.log(
-      `TX cmd=0x${cmd.toString(16)} key=0x${(keyByte & 0xff).toString(
+      `TX cmd=0x${cmd.toString(16)} r=0x${r.toString(
         16
-      )} rand=0x${rand.toString(16)}`
+      )} randField=0x${r1.toString(16)}`
     );
-    console.log("TX hex:", hex(frame));
+    console.log("TX hex:", hex(out));
   }
-  return frame;
+  return out;
 }
 
 type DecodedFrame = {
@@ -104,34 +116,38 @@ type DecodedFrame = {
   crcOk: boolean;
 };
 
-// Robust parser that can handle fragmented notifications
 function tryParseFrame(buf: Uint8Array): {
   frame?: DecodedFrame;
   used: number;
 } {
-  // Need at least minimal header
   if (buf.length < 7) return { used: 0 };
-  // Seek STX
+
+  // seek STX
   let i = 0;
   while (i + 1 < buf.length && !(buf[i] === STX0 && buf[i + 1] === STX1)) i++;
-  if (i > 0) return { used: i }; // drop noise before STX
+  if (i > 0) return { used: i };
 
   if (buf.length < 7) return { used: 0 };
   const len = buf[2];
-  const total = 2 + 1 + 1 + 1 + 1 + len + 1; // STX2 + LEN + RAND + KEY + CMD + DATA + CRC
+  const total = 2 + 1 + 1 + 1 + 1 + len + 1;
   if (buf.length < total) return { used: 0 };
 
-  const rand = buf[3],
-    key = buf[4],
-    cmd = buf[5];
+  const randField = buf[3];
+  const r = (randField - 0x32) & 0xff;
+
+  const keyWire = buf[4];
+  const cmdWire = buf[5];
   const dataEnc = buf.slice(6, 6 + len);
   const crc = buf[6 + len];
   const crcCalc = crc8(buf.slice(0, 6 + len));
+
+  const key = keyWire ^ r;
+  const cmd = cmdWire ^ r;
   const dataPlain = new Uint8Array(len);
-  for (let j = 0; j < len; j++) dataPlain[j] = dataEnc[j] ^ rand;
+  for (let j = 0; j < len; j++) dataPlain[j] = dataEnc[j] ^ r;
 
   return {
-    frame: { len, rand, key, cmd, dataPlain, crcOk: crc === crcCalc },
+    frame: { len, rand: r, key, cmd, dataPlain, crcOk: crc === crcCalc },
     used: total,
   };
 }
@@ -139,7 +155,6 @@ function tryParseFrame(buf: Uint8Array): {
 class Reassembler {
   private buf = new Uint8Array(0);
   push(chunk: Uint8Array): DecodedFrame[] {
-    // Append
     const merged = new Uint8Array(this.buf.length + chunk.length);
     merged.set(this.buf, 0);
     merged.set(chunk, this.buf.length);
@@ -156,7 +171,7 @@ class Reassembler {
   }
 }
 
-// ---- BLE helper: wait for adapter ready ----
+// BLE helpers
 async function waitPoweredOn(): Promise<void> {
   if (noble.state === "poweredOn") return;
   await new Promise<void>((resolve, reject) => {
@@ -173,41 +188,91 @@ async function waitPoweredOn(): Promise<void> {
   });
 }
 
-// ---- Connect & get TX/RX characteristics ----
 type TxRx = { tx: any; rx: any; periph: any; name: string };
 
-async function connectNUS({
-  nameContains,
-}: {
-  nameContains?: string;
-}): Promise<TxRx> {
+function charSupportsWrite(ch: any) {
+  const p: string[] = ch?.properties || [];
+  return p.includes("write");
+}
+function charSupportsWriteWoResp(ch: any) {
+  const p: string[] = ch?.properties || [];
+  return p.includes("writeWithoutResponse");
+}
+async function writeFrame(tx: any, frame: Uint8Array) {
+  // Prefer write-with-response; fallback to without-response if needed
+  if (charSupportsWrite(tx)) {
+    try {
+      await tx.writeAsync(Buffer.from(frame), /*withoutResponse=*/ false);
+      return;
+    } catch {
+      // fall through
+    }
+  }
+  if (charSupportsWriteWoResp(tx)) {
+    await tx.writeAsync(Buffer.from(frame), /*withoutResponse=*/ true);
+    return;
+  }
+  // If neither property is present, try with-response once (legacy noble sometimes works)
+  await tx.writeAsync(Buffer.from(frame), /*withoutResponse=*/ false);
+}
+
+async function connectNUS(
+  opts: {
+    id?: string;
+    nameContains?: string;
+    scanMs?: number;
+    verbose?: boolean;
+  } = {}
+): Promise<TxRx> {
+  const { id, nameContains, scanMs = 25000, verbose = false } = opts;
   await waitPoweredOn();
 
   return new Promise<TxRx>((resolve, reject) => {
-    const serviceFilter = [NUS_SERVICE];
     let resolved = false;
+    const deadline = Date.now() + scanMs;
 
     const onDiscover = async (p: any) => {
       try {
         const adv = p.advertisement || {};
-        const localName = adv.localName || "";
-        const nameOk = nameContains
-          ? (localName || "").toLowerCase().includes(nameContains.toLowerCase())
-          : true;
+        const localName = (adv.localName || "").toLowerCase();
 
-        // Check advertised services for NUS
-        const srvUuids: string[] = (adv.serviceUuids || []).map((u: string) =>
-          u.toLowerCase()
-        );
-        const nusAdvertised = srvUuids.includes("6e400001");
+        // Select target:
+        if (id) {
+          if (p.id !== id) return;
+        } else if (nameContains) {
+          if (!localName.includes(nameContains.toLowerCase())) return;
+        } else {
+          // no filter provided: require NUS advertised or a "scooter-ish" name
+          const srvUuids: string[] = (adv.serviceUuids || []).map((u: string) =>
+            u.toLowerCase()
+          );
+          const nusAdvertised = srvUuids.includes("6e400001");
+          if (!nusAdvertised && !localName.includes("scooter")) return;
+        }
 
-        if (!nameOk && !nusAdvertised) return;
+        if (verbose) {
+          const md: Buffer | undefined = adv.manufacturerData;
+          console.log("Found candidate:", {
+            id: p.id,
+            name: adv.localName,
+            rssi: p.rssi,
+            serviceUuids: adv.serviceUuids,
+            mfgDataHex: md ? hex(md) : "(none)",
+          });
+        }
 
         noble.stopScanning();
-        p.removeListener("disconnect", onDisc);
-        p.once("disconnect", onDisc);
+        let disconnectedEarly = false;
+        p.once("disconnect", () => {
+          if (!resolved) {
+            disconnectedEarly = true;
+            reject(new Error("Disconnected before service discovery"));
+          }
+        });
 
         await p.connectAsync();
+        if (disconnectedEarly) return; // guard
+
         const { characteristics } =
           await p.discoverSomeServicesAndCharacteristicsAsync(
             [NUS_SERVICE],
@@ -219,84 +284,99 @@ async function connectNUS({
         const rx = characteristics.find(
           (c: any) => c.uuid.toLowerCase() === NUS_RX.replace(/-/g, "")
         );
-        if (!tx || !rx) throw new Error("TX/RX characteristics not found");
+        if (!tx || !rx)
+          throw new Error(
+            "TX/RX characteristics not found (no NUS on this device)"
+          );
 
+        // Enable notifications & settle before first write to avoid CoreBluetooth race
         await rx.subscribeAsync();
+        await sleep(250);
+
         resolved = true;
         resolve({
           tx,
           rx,
           periph: p,
-          name: localName || p.address || "unknown",
+          name: adv.localName || p.id || "unknown",
         });
       } catch (e: any) {
         if (!resolved) reject(e);
       }
     };
 
-    const onDisc = () => {
-      if (!resolved) reject(new Error("Disconnected before service discovery"));
-    };
-
     noble.on("discover", onDiscover);
 
-    noble.startScanningAsync(serviceFilter, false).catch(reject);
-
-    // Safety timeout
     (async () => {
-      for (let i = 0; i < 30 && !resolved; i++) await sleep(1000);
-      if (!resolved) {
-        noble.removeListener("discover", onDiscover);
-        reject(new Error("Scan timeout: no Omni device found"));
-      }
-    })();
+      await noble.startScanningAsync([], true); // scan all adverts; duplicates allowed
+      while (!resolved && Date.now() < deadline) await sleep(200);
+      noble.removeListener("discover", onDiscover);
+      await noble.stopScanningAsync().catch(() => {});
+      if (!resolved) reject(new Error("Scan timeout: no matching device"));
+    })().catch(reject);
   });
 }
 
-// ---- Round-trip sender (with reassembly & per-CMD wait) ----
+// Send frame and wait for matching CMD reply (handles 0x10 Command Error)
 async function sendAndWait(
   tx: any,
   rx: any,
   frame: Uint8Array,
   expectCmd: number,
-  timeoutMs = 4000,
+  timeoutMs = 10000,
   verbose = false
 ): Promise<DecodedFrame> {
   return new Promise<DecodedFrame>(async (resolve, reject) => {
     const asm = new Reassembler();
-    let timer: NodeJS.Timeout | null = setTimeout(() => {
-      rx.removeListener("data", onData);
-      reject(new Error("Timeout waiting for response"));
-    }, timeoutMs);
 
-    function finish(dec: DecodedFrame) {
-      if (timer) clearTimeout(timer);
-      rx.removeListener("data", onData);
-      resolve(dec);
-    }
-
-    function onData(chunk: Buffer) {
+    const onData = (chunk: Buffer) => {
       const frames = asm.push(new Uint8Array(chunk));
       for (const f of frames) {
         if (verbose) {
           console.log(
-            `RX cmd=0x${f.cmd.toString(16)} rand=0x${f.rand.toString(
+            `RX cmd=0x${f.cmd.toString(16)} key=0x${f.key.toString(
               16
-            )} key=0x${f.key.toString(16)} crcOk=${f.crcOk}`
+            )} rand=0x${f.rand.toString(16)} crcOk=${f.crcOk}`
           );
-          console.log("RX hex (full frame):", hex(chunk));
           console.log("RX data (plain):", hex(f.dataPlain));
         }
-        if (f.cmd === expectCmd) return finish(f);
+        if (f.cmd === 0x10) {
+          // Command Error Notification
+          const code = f.dataPlain[0] ?? -1;
+          const msg =
+            code === 1
+              ? "CRC verification failed"
+              : code === 2
+              ? "Communication KEY not obtained (handshake missing)"
+              : code === 3
+              ? "Invalid communication KEY (wrong header key?)"
+              : `Device error code ${code}`;
+          clear();
+          return reject(new Error(`Device 0x10 error: ${msg}`));
+        }
+        if (f.cmd === expectCmd) {
+          clear();
+          return resolve(f);
+        }
       }
+    };
+    const to = setTimeout(() => {
+      clear();
+      reject(new Error("Timeout waiting for response"));
+    }, timeoutMs);
+    function clear() {
+      try {
+        rx.removeListener("data", onData);
+      } catch {}
+      clearTimeout(to);
     }
 
     rx.on("data", onData);
-    await tx.writeAsync(Buffer.from(frame), /*withoutResponse*/ true);
+    await writeFrame(tx, frame);
   });
 }
 
-// ---- High-level protocol ops ----
+// High-level protocol ops
 async function cmdHandshake(
   tx: any,
   rx: any,
@@ -306,22 +386,33 @@ async function cmdHandshake(
   const payload = asciiBytes(deviceKey);
   if (payload.length !== 8)
     throw new Error("Device KEY must be exactly 8 ASCII bytes");
-  const frame = buildFrame(0x01, payload, /*KEY*/ 0x00, verbose);
-  const rep = await sendAndWait(tx, rx, frame, 0x01, 30000, verbose);
-  if (!rep.crcOk) throw new Error("CRC error in 0x01 reply");
-  if (rep.dataPlain.length < 2) throw new Error("Bad 0x01 reply payload");
-  const status = rep.dataPlain[0];
-  const sessionKey = rep.dataPlain[1] & 0xff;
-  if (status !== 1) throw new Error("Device KEY rejected by scooter");
-  return sessionKey;
+
+  const attempt = async () => {
+    const frame = buildFrame(0x01, payload, /*header KEY*/ 0x00, verbose);
+    const rep = await sendAndWait(tx, rx, frame, 0x01, 10000, verbose);
+    if (!rep.crcOk) throw new Error("CRC error in 0x01 reply");
+    if (rep.dataPlain.length < 2) throw new Error("Bad 0x01 reply payload");
+    const status = rep.dataPlain[0];
+    const sessionKey = rep.dataPlain[1] & 0xff;
+    if (status !== 1)
+      throw new Error("Device KEY verification failed (status!=1)");
+    return sessionKey;
+  };
+
+  try {
+    return await attempt();
+  } catch (e) {
+    if (verbose) console.warn("Handshake retry:", (e as Error).message);
+    await sleep(200);
+    return await attempt();
+  }
 }
 
 async function cmdQueryInfo(tx: any, rx: any, sk: number, verbose = false) {
-  const data = Uint8Array.from([0x01]); // control byte per spec
-  const frame = buildFrame(0x31, data, sk, verbose);
-  const rep = await sendAndWait(tx, rx, frame, 0x31, 4000, verbose);
+  const frame = buildFrame(0x31, Uint8Array.from([0x01]), sk, verbose);
+  const rep = await sendAndWait(tx, rx, frame, 0x31, 8000, verbose);
   if (!rep.crcOk) throw new Error("CRC error in 0x31 reply");
-  console.log("IoT info (0x31) data:", hex(rep.dataPlain));
+  console.log("IoT info (0x31):", hex(rep.dataPlain));
 }
 
 async function cmdUnlock(
@@ -333,7 +424,7 @@ async function cmdUnlock(
   noTimerReset = false,
   verbose = false
 ) {
-  // [0]=0x01, [1..4]=userId (big-endian), [5..8]=timestamp (big-endian), [9]=status flag
+  // [0]=0x01, [1..4]=userId BE, [5..8]=timestamp BE, [9]=flags
   const d = new Uint8Array(10);
   d[0] = 0x01;
   d[1] = (userId >>> 24) & 0xff;
@@ -347,35 +438,35 @@ async function cmdUnlock(
   d[9] = noTimerReset ? 0xa0 : 0x00;
 
   const frame = buildFrame(0x05, d, sk, verbose);
-  const rep = await sendAndWait(tx, rx, frame, 0x05, 5000, verbose);
+  const rep = await sendAndWait(tx, rx, frame, 0x05, 10000, verbose);
   if (!rep.crcOk) throw new Error("CRC error in 0x05 reply");
 
-  // Mandatory ACK (DATA=0x02), no reply expected
+  // Required ACK: DATA=0x02, no response expected
   const ack = buildFrame(0x05, Uint8Array.from([0x02]), sk, verbose);
-  await tx.writeAsync(Buffer.from(ack), true);
+  await writeFrame(tx, ack);
   console.log("Unlock sent and ACKed.");
 }
 
 async function cmdLock(tx: any, rx: any, sk: number, verbose = false) {
   const frame = buildFrame(0x15, Uint8Array.from([0x01]), sk, verbose);
-  const rep = await sendAndWait(tx, rx, frame, 0x15, 5000, verbose);
+  const rep = await sendAndWait(tx, rx, frame, 0x15, 10000, verbose);
   if (!rep.crcOk) throw new Error("CRC error in 0x15 reply");
 
   const ack = buildFrame(0x15, Uint8Array.from([0x02]), sk, verbose);
-  await tx.writeAsync(Buffer.from(ack), true);
+  await writeFrame(tx, ack);
   console.log("Lock sent and ACKed.");
 }
 
-// ---- CLI glue ----
+// CLI
 type Args = {
-  name?: string; // substring of localName to match
+  id?: string; // CoreBluetooth id from scan
+  name?: string; // substring of localName
   deviceKey?: string; // 8 ASCII chars
   action?: "query" | "unlock" | "lock";
   userId?: string;
   noTimerReset?: string | boolean;
   verbose?: string | boolean;
 };
-
 function parseArgs(): Args {
   const out: any = {};
   for (const a of process.argv.slice(2)) {
@@ -386,8 +477,10 @@ function parseArgs(): Args {
   return out as Args;
 }
 
+// Main
 (async () => {
   const args = parseArgs();
+  const id = args.id;
   const name = args.name;
   const deviceKey = (args.deviceKey || DEFAULT_DEVICE_KEY) as string;
   const action = (args.action || "query") as Args["action"];
@@ -395,22 +488,25 @@ function parseArgs(): Args {
 
   if (process.platform === "darwin" && (args as any).mac) {
     console.warn(
-      "Note: macOS CoreBluetooth does not expose device MAC addresses. Use --name=... or rely on service UUID filtering."
+      "Note: macOS doesn’t expose BLE MAC addresses. Use --name=... or --id=..."
     );
   }
 
   console.log("Scanning for Omni scooter…", {
-    name: name ?? "(any with NUS service)",
+    id: id ?? "(any)",
+    name: name ?? "(any)",
   });
   const {
     tx,
     rx,
     periph,
     name: foundName,
-  } = await connectNUS({ nameContains: name });
+  } = await connectNUS({ id, nameContains: name, scanMs: 25000, verbose });
   console.log(`Connected to: ${foundName}`);
 
-  // Handshake MUST be within ~5s of connect
+  // tiny extra settle to be safe (connectNUS already waited 250ms post-subscribe)
+  await sleep(100);
+
   console.log("Performing 0x01 handshake…");
   const sessionKey = await cmdHandshake(tx, rx, deviceKey, verbose);
   console.log("Session KEY:", "0x" + sessionKey.toString(16).padStart(2, "0"));
@@ -435,7 +531,7 @@ function parseArgs(): Args {
   }
 
   console.log("Done. Disconnecting…");
-  await periph.disconnectAsync();
+  await periph.disconnectAsync().catch(() => {});
   process.exit(0);
 })().catch((err) => {
   console.error("ERROR:", err?.message || err);
